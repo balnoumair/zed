@@ -7,8 +7,8 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    AtlasTextureId, BackdropBlur, Background, Bounds, ContentMask, DevicePixels, DrawOrder,
+    PaintSurface, Path, Point, PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -22,7 +22,10 @@ use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
     CAMetalLayer, CommandQueue, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions, NSRange,
 };
-use objc::{self, msg_send, sel, sel_impl};
+use objc::{self, class, msg_send, sel, sel_impl};
+
+#[link(name = "MetalPerformanceShaders", kind = "framework")]
+unsafe extern "C" {}
 use parking_lot::Mutex;
 
 use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
@@ -37,6 +40,13 @@ const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitch
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
+
+/// Rendered frames without a backdrop blur (resp. without paths) before the
+/// scratch textures backing that feature are released. Long enough to ride
+/// out popover close/reopen and brief path-free frames, short enough that a
+/// few seconds of activity reclaims the memory.
+const SCRATCH_RELEASE_AFTER_FRAMES: u32 = 30;
+
 /// Metal requires the offset a buffer is bound at to be 256-byte aligned.
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
@@ -121,6 +131,21 @@ pub struct MetalRenderer {
     paths_rasterization_pipeline_state: metal::RenderPipelineState,
     path_sprites_pipeline_state: metal::RenderPipelineState,
     shadows_pipeline_state: metal::RenderPipelineState,
+    backdrop_blur_pipeline_state: metal::RenderPipelineState,
+    /// Framebuffer snapshot (blit dst / gaussian src) + the blurred result the
+    /// draw samples from. Sized to the padded blur region (not the drawable),
+    /// recreated when the needed region outgrows them, and released along with
+    /// `backdrop_kernel` after [`SCRATCH_RELEASE_AFTER_FRAMES`] blur-free
+    /// frames.
+    backdrop_scratch: Option<metal::Texture>,
+    backdrop_blurred: Option<metal::Texture>,
+    /// Cached `MPSImageGaussianBlur` kernel, keyed by sigma.
+    backdrop_kernel: Option<(f32, *mut objc::runtime::Object)>,
+    /// Consecutive frames rendered without any backdrop blur / any path.
+    blur_free_frames: u32,
+    path_free_frames: u32,
+    /// Last time `COMET_GPU_STATS` logged.
+    stats_last_log: Option<std::time::Instant>,
     quads_pipeline_state: metal::RenderPipelineState,
     underlines_pipeline_state: metal::RenderPipelineState,
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
@@ -138,6 +163,14 @@ pub struct MetalRenderer {
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "test-support"))]
     headless_render_target: Option<metal::Texture>,
+}
+
+impl Drop for MetalRenderer {
+    fn drop(&mut self) {
+        // The MPS kernel is a manually-retained ObjC object; everything else
+        // releases through metal-rs wrappers.
+        self.release_backdrop_resources();
+    }
 }
 
 #[repr(C)]
@@ -283,6 +316,14 @@ impl MetalRenderer {
             "shadow_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let backdrop_blur_pipeline_state = build_pipeline_state_no_blend(
+            &device,
+            &library,
+            "backdrop_blur",
+            "backdrop_blur_vertex",
+            "backdrop_blur_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
         let quads_pipeline_state = build_pipeline_state(
             &device,
             &library,
@@ -340,6 +381,13 @@ impl MetalRenderer {
             paths_rasterization_pipeline_state,
             path_sprites_pipeline_state,
             shadows_pipeline_state,
+            backdrop_blur_pipeline_state,
+            backdrop_scratch: None,
+            backdrop_blurred: None,
+            backdrop_kernel: None,
+            blur_free_frames: 0,
+            path_free_frames: 0,
+            stats_last_log: None,
             quads_pipeline_state,
             underlines_pipeline_state,
             monochrome_sprites_pipeline_state,
@@ -660,6 +708,30 @@ impl MetalRenderer {
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.opaque { 1. } else { 0. };
 
+        // Big scratch textures are only worth holding while they're in use:
+        // after a run of frames that don't need them, drop them and let the
+        // next popover-open / path frame absorb a one-time recreation.
+        // (Releasing is safe with frames in flight — command buffers retain
+        // the resources they reference.)
+        if scene.backdrop_blurs.is_empty() {
+            self.blur_free_frames = self.blur_free_frames.saturating_add(1);
+            if self.blur_free_frames >= SCRATCH_RELEASE_AFTER_FRAMES {
+                self.release_backdrop_resources();
+            }
+        } else {
+            self.blur_free_frames = 0;
+        }
+        if scene.paths.is_empty() {
+            self.path_free_frames = self.path_free_frames.saturating_add(1);
+            if self.path_free_frames >= SCRATCH_RELEASE_AFTER_FRAMES {
+                self.path_intermediate_texture = None;
+                self.path_intermediate_msaa_texture = None;
+            }
+        } else {
+            self.path_free_frames = 0;
+            self.update_path_intermediate_textures(viewport_size);
+        }
+
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
             texture,
@@ -667,7 +739,106 @@ impl MetalRenderer {
             Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
         );
 
+        let mut pending_blurs = scene.backdrop_blurs.iter().peekable();
         for batch in scene.batches() {
+            // Backdrop blurs interleave by draw order OUTSIDE the batch
+            // stream: break the pass here, snapshot the framebuffer, and
+            // paint the blurred region back before continuing.
+            while pending_blurs
+                .peek()
+                .is_some_and(|blur| blur.order <= batch_first_order(scene, &batch))
+            {
+                let blur = *pending_blurs.next().unwrap();
+                // The blur only ever samples its visible (clipped) bounds,
+                // and the gaussian only reaches ~3σ beyond a sampled pixel —
+                // so snapshot just that padded region instead of the whole
+                // drawable (popovers are small; this is a 10-20x reduction).
+                let sigma = blur.blur_radius.0.max(1.0);
+                let padding = (sigma * 3.0).ceil() + 2.0;
+                let visible = blur.bounds.intersect(&blur.content_mask.bounds);
+                let drawable_width = texture.width() as i64;
+                let drawable_height = texture.height() as i64;
+                let x0 = ((visible.origin.x.0 - padding).floor() as i64).max(0);
+                let y0 = ((visible.origin.y.0 - padding).floor() as i64).max(0);
+                let x1 = (((visible.origin.x.0 + visible.size.width.0) + padding).ceil() as i64)
+                    .min(drawable_width);
+                let y1 = (((visible.origin.y.0 + visible.size.height.0) + padding).ceil() as i64)
+                    .min(drawable_height);
+                if x1 <= x0 || y1 <= y0 {
+                    // Fully clipped or off-screen: nothing to blur.
+                    continue;
+                }
+                command_encoder.end_encoding();
+                let (scratch, blurred) = self.ensure_backdrop_scratch(
+                    (x1 - x0) as u64,
+                    (y1 - y0) as u64,
+                    drawable_width as u64,
+                    drawable_height as u64,
+                    texture.pixel_format(),
+                );
+                // Position the copy window so it covers the padded region yet
+                // stays inside the drawable, and fill the ENTIRE texture:
+                // texture edges then always hold real framebuffer content, so
+                // the gaussian's clamp edge mode behaves exactly as it did
+                // with drawable-sized textures (no vignette, and a texture
+                // edge coincides with the window edge precisely when the blur
+                // region is clamped against it).
+                let copy_x = x0.min(drawable_width - scratch.width() as i64).max(0) as u64;
+                let copy_y = y0.min(drawable_height - scratch.height() as i64).max(0) as u64;
+                let blit = command_buffer.new_blit_command_encoder();
+                blit.copy_from_texture(
+                    texture,
+                    0,
+                    0,
+                    metal::MTLOrigin {
+                        x: copy_x,
+                        y: copy_y,
+                        z: 0,
+                    },
+                    metal::MTLSize {
+                        width: scratch.width(),
+                        height: scratch.height(),
+                        depth: 1,
+                    },
+                    &scratch,
+                    0,
+                    0,
+                    metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                );
+                blit.end_encoding();
+                {
+                    use metal::foreign_types::ForeignType as _;
+                    let kernel = self.ensure_gaussian_kernel(sigma);
+                    unsafe {
+                        let _: () = msg_send![
+                            kernel,
+                            encodeToCommandBuffer: command_buffer.as_ptr() as *mut objc::runtime::Object
+                            sourceTexture: scratch.as_ptr() as *mut objc::runtime::Object
+                            destinationTexture: blurred.as_ptr() as *mut objc::runtime::Object
+                        ];
+                    }
+                }
+                command_encoder = new_command_encoder_for_texture(
+                    command_buffer,
+                    texture,
+                    viewport_size,
+                    None,
+                );
+                let source_rect = [
+                    copy_x as f32,
+                    copy_y as f32,
+                    scratch.width() as f32,
+                    scratch.height() as f32,
+                ];
+                self.draw_backdrop_blurs(
+                    &[blur],
+                    source_rect,
+                    writer,
+                    viewport_size,
+                    &blurred,
+                    command_encoder,
+                )?;
+            }
             match batch {
                 PrimitiveBatch::Shadows(range) => {
                     self.draw_shadows(range, instance_bindings, viewport_size, command_encoder)
@@ -737,7 +908,204 @@ impl MetalRenderer {
 
         command_encoder.end_encoding();
 
+        self.maybe_log_gpu_stats();
+
         Ok(command_buffer.to_owned())
+    }
+
+    /// `COMET_GPU_STATS=1`: log GPU-side memory holdings every 10s so
+    /// regressions show up in logs without Instruments.
+    fn maybe_log_gpu_stats(&mut self) {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        if !*ENABLED.get_or_init(|| {
+            std::env::var_os("COMET_GPU_STATS").is_some_and(|v| v != "0" && !v.is_empty())
+        }) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .stats_last_log
+            .is_some_and(|last| now.duration_since(last).as_secs() < 10)
+        {
+            return;
+        }
+        self.stats_last_log = Some(now);
+
+        let texture_bytes = |texture: &Option<metal::Texture>| {
+            texture
+                .as_ref()
+                .map_or(0, |t| t.width() * t.height() * 4)
+        };
+        let backdrop_bytes =
+            texture_bytes(&self.backdrop_scratch) + texture_bytes(&self.backdrop_blurred);
+        // The MSAA texture is memoryless on Apple GPUs (tile memory only).
+        let path_bytes = texture_bytes(&self.path_intermediate_texture)
+            * if self.path_intermediate_msaa_texture.is_some() && !self.is_apple_gpu {
+                1 + self.path_sample_count as u64
+            } else {
+                1
+            };
+        let (atlas_textures, atlas_bytes) = self.sprite_atlas.texture_stats();
+        let (pool_buffers, pool_buffer_size) = {
+            let pool = self.instance_buffer_pool.lock();
+            (pool.buffers.len(), pool.buffer_size)
+        };
+        // stderr, not `log`: consumers (comet) run tracing without a log
+        // bridge, and this line only exists when explicitly opted into.
+        eprintln!(
+            "[gpu-stats] device: {:.1} MB; atlas: {} textures, {:.1} MB; instance pool: {} × {:.1} MB; backdrop scratch: {:.1} MB; path intermediate: {:.1} MB",
+            self.device.current_allocated_size() as f64 / (1024.0 * 1024.0),
+            atlas_textures,
+            atlas_bytes as f64 / (1024.0 * 1024.0),
+            pool_buffers,
+            pool_buffer_size as f64 / (1024.0 * 1024.0),
+            backdrop_bytes as f64 / (1024.0 * 1024.0),
+            path_bytes as f64 / (1024.0 * 1024.0),
+        );
+    }
+
+    /// Scratch textures sized to the padded blur region (not the drawable).
+    /// A cached pair is reused as long as it can hold the needed region AND
+    /// still fits inside the drawable — the blit always fills the whole
+    /// texture, which is what keeps reuse correct (no stale texels, and edge
+    /// clamping still coincides with the window edge when clamped there).
+    fn ensure_backdrop_scratch(
+        &mut self,
+        needed_width: u64,
+        needed_height: u64,
+        drawable_width: u64,
+        drawable_height: u64,
+        format: MTLPixelFormat,
+    ) -> (metal::Texture, metal::Texture) {
+        let reusable = self.backdrop_scratch.as_ref().is_some_and(|scratch| {
+            scratch.pixel_format() == format
+                && scratch.width() >= needed_width
+                && scratch.width() <= drawable_width
+                && scratch.height() >= needed_height
+                && scratch.height() <= drawable_height
+        });
+        if !reusable {
+            // Quantize up so popovers whose sizes differ slightly share one
+            // allocation instead of churning every open.
+            const QUANTUM: u64 = 256;
+            let width = (needed_width.div_ceil(QUANTUM) * QUANTUM).min(drawable_width);
+            let height = (needed_height.div_ceil(QUANTUM) * QUANTUM).min(drawable_height);
+            let descriptor = metal::TextureDescriptor::new();
+            descriptor.set_texture_type(metal::MTLTextureType::D2);
+            descriptor.set_pixel_format(format);
+            descriptor.set_width(width);
+            descriptor.set_height(height);
+            descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
+            descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+            self.backdrop_scratch = Some(self.device.new_texture(&descriptor));
+            // The gaussian kernel writes via compute — the dst needs ShaderWrite.
+            descriptor.set_usage(
+                metal::MTLTextureUsage::ShaderRead | metal::MTLTextureUsage::ShaderWrite,
+            );
+            self.backdrop_blurred = Some(self.device.new_texture(&descriptor));
+        }
+        (
+            self.backdrop_scratch.clone().unwrap(),
+            self.backdrop_blurred.clone().unwrap(),
+        )
+    }
+
+    /// Drop the backdrop scratch textures and the cached gaussian kernel;
+    /// they're recreated on demand the next time a frame contains a blur.
+    fn release_backdrop_resources(&mut self) {
+        self.backdrop_scratch = None;
+        self.backdrop_blurred = None;
+        if let Some((_, kernel)) = self.backdrop_kernel.take() {
+            unsafe {
+                let _: () = msg_send![kernel, release];
+            }
+        }
+    }
+
+    /// The cached `MPSImageGaussianBlur` for `sigma` (device px) — Apple's
+    /// optimized true gaussian; hand-rolled sparse taps ghosted on text.
+    fn ensure_gaussian_kernel(&mut self, sigma: f32) -> *mut objc::runtime::Object {
+        use metal::foreign_types::ForeignType as _;
+        if let Some((cached_sigma, kernel)) = self.backdrop_kernel {
+            if (cached_sigma - sigma).abs() < 0.01 {
+                return kernel;
+            }
+            unsafe {
+                let _: () = msg_send![kernel, release];
+            }
+        }
+        let kernel: *mut objc::runtime::Object = unsafe {
+            let alloc: *mut objc::runtime::Object =
+                msg_send![class!(MPSImageGaussianBlur), alloc];
+            let kernel: *mut objc::runtime::Object = msg_send![
+                alloc,
+                initWithDevice: self.device.as_ptr() as *mut objc::runtime::Object
+                sigma: sigma
+            ];
+            // Clamp edges: the default zero-edge mode bleeds transparent black
+            // into blurs near the window border (dark vignette).
+            let _: () = msg_send![kernel, setEdgeMode: 1u64];
+            kernel
+        };
+        self.backdrop_kernel = Some((sigma, kernel));
+        kernel
+    }
+
+    fn draw_backdrop_blurs(
+        &self,
+        blurs: &[BackdropBlur],
+        // Device-pixel rect of the drawable the source texture was
+        // snapshotted from: [x, y, width, height].
+        source_rect: [f32; 4],
+        writer: &mut InstanceBufferWriter,
+        viewport_size: Size<DevicePixels>,
+        source_texture: &metal::TextureRef,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> Result<()> {
+        if blurs.is_empty() {
+            return Ok(());
+        }
+        let blur_bindings = writer.write(blurs)?;
+
+        command_encoder.set_render_pipeline_state(&self.backdrop_blur_pipeline_state);
+        command_encoder.set_vertex_buffer(
+            BackdropBlurInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_vertex_buffer(
+            BackdropBlurInputIndex::Blurs as u64,
+            Some(&blur_bindings.buffer),
+            blur_bindings.offset as u64,
+        );
+        command_encoder.set_fragment_buffer(
+            BackdropBlurInputIndex::Blurs as u64,
+            Some(&blur_bindings.buffer),
+            blur_bindings.offset as u64,
+        );
+        command_encoder.set_vertex_bytes(
+            BackdropBlurInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_bytes(
+            BackdropBlurInputIndex::SourceRect as u64,
+            mem::size_of_val(&source_rect) as u64,
+            source_rect.as_ptr() as *const _,
+        );
+        command_encoder.set_fragment_texture(
+            BackdropBlurInputIndex::SourceTexture as u64,
+            Some(source_texture),
+        );
+
+        command_encoder.draw_primitives_instanced(
+            metal::MTLPrimitiveType::Triangle,
+            0,
+            6,
+            blurs.len() as u64,
+        );
+        Ok(())
     }
 
     fn draw_paths_to_intermediate(
@@ -1300,6 +1668,53 @@ fn build_pipeline_state(
         .expect("could not create render pipeline state")
 }
 
+fn build_pipeline_state_no_blend(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    label: &str,
+    vertex_fn_name: &str,
+    fragment_fn_name: &str,
+    pixel_format: metal::MTLPixelFormat,
+) -> metal::RenderPipelineState {
+    let vertex_fn = library
+        .get_function(vertex_fn_name, None)
+        .expect("error locating vertex function");
+    let fragment_fn = library
+        .get_function(fragment_fn_name, None)
+        .expect("error locating fragment function");
+
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(label);
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(pixel_format);
+    color_attachment.set_blending_enabled(false);
+
+    device
+        .new_render_pipeline_state(&descriptor)
+        .expect("could not create render pipeline state")
+}
+
+/// The draw order of a batch's first primitive — where the backdrop-blur
+/// interleave check anchors.
+fn batch_first_order(scene: &Scene, batch: &PrimitiveBatch) -> DrawOrder {
+    match batch {
+        PrimitiveBatch::Shadows(range) => scene.shadows[range.start].order,
+        PrimitiveBatch::Quads(range) => scene.quads[range.start].order,
+        PrimitiveBatch::Paths(range) => scene.paths[range.start].order,
+        PrimitiveBatch::Underlines(range) => scene.underlines[range.start].order,
+        PrimitiveBatch::MonochromeSprites { range, .. } => {
+            scene.monochrome_sprites[range.start].order
+        }
+        PrimitiveBatch::SubpixelSprites { range, .. } => scene.subpixel_sprites[range.start].order,
+        PrimitiveBatch::PolychromeSprites { range, .. } => {
+            scene.polychrome_sprites[range.start].order
+        }
+        PrimitiveBatch::Surfaces(range) => scene.surfaces[range.start].order,
+    }
+}
+
 fn build_path_sprite_pipeline_state(
     device: &metal::DeviceRef,
     library: &metal::LibraryRef,
@@ -1538,6 +1953,17 @@ enum ShadowInputIndex {
     Vertices = 0,
     Shadows = 1,
     ViewportSize = 2,
+}
+
+#[repr(C)]
+enum BackdropBlurInputIndex {
+    Vertices = 0,
+    Blurs = 1,
+    ViewportSize = 2,
+    SourceTexture = 3,
+    /// Drawable rect the snapshot covers (x, y, w, h in device px) — the
+    /// fragment shader maps frag position → snapshot UV through it.
+    SourceRect = 4,
 }
 
 #[repr(C)]
