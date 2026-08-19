@@ -6,7 +6,7 @@ use crate::Inspector;
 use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
+    AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
@@ -16,7 +16,7 @@ use crate::{
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
     Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, BackdropBlur, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
     TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
@@ -815,6 +815,44 @@ impl HitboxId {
     }
 }
 
+/// A scoped vertical edge fade (see [`Window::with_edge_fade`]): primitives
+/// painted inside the scope get their opacity multiplied by a ramp that runs
+/// from 0 at an active edge of `bounds` to 1 a `band` further in. Built for
+/// scroll-edge fades over translucent/blurred window backgrounds, where a
+/// backdrop-colored gradient overlay cannot exist (there is no paintable
+/// color equal to "what is behind the window").
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EdgeFade {
+    /// The faded region, in window coordinates.
+    pub bounds: Bounds<Pixels>,
+    /// Ramp height inside each active edge.
+    pub band: Pixels,
+    /// Per-edge override of [`Self::band`] for the top edge (`None` = `band`).
+    /// Asymmetric ramps let content fade across chrome of different heights —
+    /// e.g. a short titlebar above, a tall composer below.
+    pub band_top: Option<Pixels>,
+    /// Per-edge override of [`Self::band`] for the bottom edge.
+    pub band_bottom: Option<Pixels>,
+    /// Fade primitives approaching the region's top edge.
+    pub top: bool,
+    /// Fade primitives approaching the region's bottom edge.
+    pub bottom: bool,
+    /// Fade primitives approaching the region's left edge.
+    pub left: bool,
+    /// Fade primitives approaching the region's right edge.
+    pub right: bool,
+}
+
+impl EdgeFade {
+    fn top_band(&self) -> f32 {
+        self.band_top.unwrap_or(self.band).0.max(1.0)
+    }
+
+    fn bottom_band(&self) -> f32 {
+        self.band_bottom.unwrap_or(self.band).0.max(1.0)
+    }
+}
+
 /// A rectangular region that potentially blocks hitboxes inserted prior.
 /// See [Window::insert_hitbox] for more details.
 #[derive(Clone, Debug, Deref)]
@@ -1154,6 +1192,7 @@ pub struct Window {
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
+    pub(crate) edge_fade: Option<EdgeFade>,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
@@ -1844,6 +1883,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
+            edge_fade: None,
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -3619,6 +3659,30 @@ impl Window {
         result
     }
 
+    /// Executes the provided function with a vertical [`EdgeFade`] applied:
+    /// every primitive painted inside is additionally faded by its vertical
+    /// position — full alpha in the region's body, ramping to zero across
+    /// `fade.band` at each active edge. Granularity is per-primitive (each
+    /// quad/glyph/sprite takes the ramp value at its own position), which
+    /// reads as a smooth gradient for text and small marks.
+    pub fn with_edge_fade<R>(
+        &mut self,
+        fade: Option<EdgeFade>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let Some(fade) = fade else {
+            return f(self);
+        };
+        if !(fade.top || fade.bottom || fade.left || fade.right) {
+            return f(self);
+        }
+        self.invalidator.debug_assert_paint_or_prepaint();
+        let previous = self.edge_fade.replace(fade);
+        let result = f(self);
+        self.edge_fade = previous;
+        result
+    }
+
     /// Perform prepaint on child elements in a "retryable" manner, so that any side effects
     /// of prepaints can be discarded before prepainting again. This is used to support autoscroll
     /// where we need to prepaint children to detect the autoscroll bounds, then adjust the
@@ -3716,6 +3780,105 @@ impl Window {
     pub(crate) fn element_opacity(&self) -> f32 {
         self.invalidator.debug_assert_paint_or_prepaint();
         self.element_opacity
+    }
+
+    /// The element opacity at a position (window coords): the scoped uniform
+    /// opacity times the [`EdgeFade`] ramp evaluated at `center`.
+    #[inline]
+    pub(crate) fn element_opacity_at(&self, center: Point<Pixels>) -> f32 {
+        let opacity = self.element_opacity();
+        let Some(fade) = &self.edge_fade else {
+            return opacity;
+        };
+        let band = fade.band.0.max(1.0);
+        let mut ramp: f32 = 1.0;
+        if fade.top {
+            ramp = ramp
+                .min(((center.y.0 - fade.bounds.top().0) / fade.top_band()).clamp(0.0, 1.0));
+        }
+        if fade.bottom {
+            ramp = ramp
+                .min(((fade.bounds.bottom().0 - center.y.0) / fade.bottom_band()).clamp(0.0, 1.0));
+        }
+        if fade.left {
+            ramp = ramp.min(((center.x.0 - fade.bounds.left().0) / band).clamp(0.0, 1.0));
+        }
+        if fade.right {
+            ramp = ramp.min(((fade.bounds.right().0 - center.x.0) / band).clamp(0.0, 1.0));
+        }
+        // Quadratic ease-in: a linear ramp reads weak over a wide band —
+        // content sliding under glass chrome stayed half-visible for most of
+        // the traverse. Squaring drops it fast near the fade edge while
+        // keeping the far end fully opaque.
+        opacity * ramp * ramp
+    }
+
+    /// The element opacity for a primitive covering `bounds`: the scoped
+    /// uniform opacity times the [`EdgeFade`] ramp at the bounds' NEAREST
+    /// point to each active edge. Conservative on purpose — a sprite reaches
+    /// zero exactly as its leading edge touches the region boundary, so the
+    /// clip can never slice a visible glyph (center sampling left dim-but-
+    /// sliced glyphs at the edge).
+    #[inline]
+    pub(crate) fn element_opacity_for_bounds(&self, bounds: &Bounds<Pixels>) -> f32 {
+        let opacity = self.element_opacity();
+        let Some(fade) = &self.edge_fade else {
+            return opacity;
+        };
+        let band = fade.band.0.max(1.0);
+        let mut ramp: f32 = 1.0;
+        if fade.top {
+            ramp = ramp
+                .min(((bounds.top().0 - fade.bounds.top().0) / fade.top_band()).clamp(0.0, 1.0));
+        }
+        if fade.bottom {
+            ramp = ramp.min(
+                ((fade.bounds.bottom().0 - bounds.bottom().0) / fade.bottom_band())
+                    .clamp(0.0, 1.0),
+            );
+        }
+        if fade.left {
+            ramp = ramp.min(((bounds.left().0 - fade.bounds.left().0) / band).clamp(0.0, 1.0));
+        }
+        if fade.right {
+            ramp = ramp.min(((fade.bounds.right().0 - bounds.right().0) / band).clamp(0.0, 1.0));
+        }
+        // Quadratic ease-in — see element_opacity_at.
+        opacity * ramp * ramp
+    }
+
+    /// The active [`EdgeFade`] scope as device-pixel shader params
+    /// ([`crate::EdgeFadeParams`]) — zeroed when no scope (or no active
+    /// edge) exists. Quads and polychrome sprites carry these into the
+    /// fragment shader for a TRUE per-pixel fade, all four edges (glyphs
+    /// keep their CPU-side per-glyph curve).
+    fn scaled_edge_fade(&self) -> crate::EdgeFadeParams {
+        let Some(fade) = &self.edge_fade else {
+            return Default::default();
+        };
+        if !(fade.top || fade.bottom || fade.left || fade.right) {
+            return Default::default();
+        }
+        let scale = self.scale_factor();
+        let band = fade.band.0.max(1.0);
+        crate::EdgeFadeParams {
+            top_y: fade.bounds.top().0 * scale,
+            bottom_y: fade.bounds.bottom().0 * scale,
+            band_top: if fade.top {
+                fade.top_band() * scale
+            } else {
+                0.0
+            },
+            band_bottom: if fade.bottom {
+                fade.bottom_band() * scale
+            } else {
+                0.0
+            },
+            left_x: fade.bounds.left().0 * scale,
+            right_x: fade.bounds.right().0 * scale,
+            band_left: if fade.left { band * scale } else { 0.0 },
+            band_right: if fade.right { band * scale } else { 0.0 },
+        }
     }
 
     /// Obtain the current content mask. This method should only be called during element drawing.
@@ -3984,7 +4147,7 @@ impl Window {
 
         let scale_factor = self.scale_factor();
         let content_mask = self.snapped_content_mask();
-        let opacity = self.element_opacity();
+        let opacity = self.element_opacity_for_bounds(&bounds);
         let element_bounds = self.cover_bounds(bounds);
         let element_corner_radii = corner_radii.scale(scale_factor);
         for shadow in shadows {
@@ -4020,7 +4183,7 @@ impl Window {
 
         let scale_factor = self.scale_factor();
         let content_mask = self.snapped_content_mask();
-        let opacity = self.element_opacity();
+        let opacity = self.element_opacity_for_bounds(&bounds);
         let element_bounds = self.cover_bounds(bounds);
         let element_corner_radii = corner_radii.scale(scale_factor);
         for shadow in shadows {
@@ -4050,6 +4213,44 @@ impl Window {
                 pad: 0,
             });
         }
+    }
+
+    /// Paint a within-window backdrop blur: everything already painted
+    /// beneath `bounds` is snapshotted and painted back gaussian-blurred
+    /// inside the rounded rect (frosted-glass popovers). macOS Metal only —
+    /// other renderers ignore it, so callers keep a translucent fill over it
+    /// and the fallback is merely unblurred. Content painted AFTER this call
+    /// composites on top of the blur.
+    pub fn paint_backdrop_blur(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        blur_radius: Pixels,
+    ) {
+        self.invalidator.debug_assert_paint();
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask().scale(scale_factor);
+        // Invisible splitter primitive: forces a batch boundary at this order
+        // so the renderer can break its render pass exactly here.
+        self.next_frame.scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(0.),
+            bounds: bounds.scale(scale_factor),
+            corner_radii: corner_radii.scale(scale_factor),
+            content_mask,
+            color: crate::transparent_black(),
+            element_bounds: bounds.scale(scale_factor),
+            element_corner_radii: corner_radii.scale(scale_factor),
+            inset: 0,
+            pad: 0,
+        });
+        self.next_frame.scene.insert_backdrop_blur(BackdropBlur {
+            order: 0,
+            blur_radius: blur_radius.scale(scale_factor),
+            bounds: bounds.scale(scale_factor),
+            content_mask,
+            corner_radii: corner_radii.scale(scale_factor),
+        });
     }
 
     fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
@@ -4103,18 +4304,25 @@ impl Window {
     pub fn paint_quad(&mut self, quad: PaintQuad) {
         self.invalidator.debug_assert_paint();
 
+        // Scoped edge fades apply PER PIXEL in the fragment shader
+        // ([`Quad::fade`]); only the uniform element opacity bakes into the
+        // colors here. (A CPU-side gradient rewrite used to approximate the
+        // fade for solid fills — per-primitive alpha for everything else —
+        // and large fills/images popped or smeared at the band.)
         let opacity = self.element_opacity();
+        let background = quad.background.opacity(opacity);
         let snapped_bounds = self.snap_bounds(quad.bounds);
         let snapped_border_widths = self.snap_border_widths(quad.border_widths);
         let quad = Quad {
             order: 0,
             bounds: snapped_bounds,
             content_mask: self.snapped_content_mask(),
-            background: quad.background.opacity(opacity),
+            background,
             border_color: quad.border_color.opacity(opacity),
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
+            fade: self.scaled_edge_fade(),
         };
 
         if !quad.background.is_transparent() {
@@ -4176,7 +4384,7 @@ impl Window {
 
         let scale_factor = self.scale_factor();
         let content_mask = self.content_mask();
-        let opacity = self.element_opacity();
+        let opacity = self.element_opacity_for_bounds(&path.bounds);
         path.content_mask = content_mask;
         let color: Background = color.into();
         path.color = color.opacity(opacity);
@@ -4207,7 +4415,7 @@ impl Window {
             origin: origin.map(|c| ScaledPixels(round_to_device_pixel(c.0, scale_factor))),
             size: size(self.snap_stroke(width), height),
         };
-        let element_opacity = self.element_opacity();
+        let element_opacity = self.element_opacity_at(origin);
 
         self.next_frame.scene.insert_primitive(Underline {
             order: 0,
@@ -4237,7 +4445,7 @@ impl Window {
             origin: origin.map(|c| ScaledPixels(round_to_device_pixel(c.0, scale_factor))),
             size: size(self.snap_stroke(width), self.snap_stroke(height)),
         };
-        let opacity = self.element_opacity();
+        let opacity = self.element_opacity_at(origin);
 
         self.next_frame.scene.insert_primitive(Underline {
             order: 0,
@@ -4268,7 +4476,10 @@ impl Window {
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
-        let element_opacity = self.element_opacity();
+        let element_opacity = self.element_opacity_for_bounds(&Bounds {
+            origin,
+            size: size(font_size * 0.6, font_size),
+        });
         let scale_factor = self.scale_factor();
         let glyph_origin = origin.scale(scale_factor);
 
@@ -4410,6 +4621,7 @@ impl Window {
                 bounds,
                 corner_radii: Default::default(),
                 content_mask,
+                fade: self.scaled_edge_fade(),
                 tile,
                 opacity,
             });
@@ -4431,7 +4643,7 @@ impl Window {
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
-        let element_opacity = self.element_opacity();
+        let element_opacity = self.element_opacity_for_bounds(&bounds);
         let bounds = self.snap_bounds(bounds);
 
         let params = RenderSvgParams {
@@ -4499,8 +4711,6 @@ impl Window {
         frame_index: usize,
         grayscale: bool,
     ) -> Result<()> {
-        self.invalidator.debug_assert_paint();
-
         let visible_bounds = bounds.intersect(&image_bounds);
         if visible_bounds.size.width <= Pixels::ZERO || visible_bounds.size.height <= Pixels::ZERO {
             return Ok(());
@@ -4508,7 +4718,36 @@ impl Window {
         if image_bounds.size.width <= Pixels::ZERO || image_bounds.size.height <= Pixels::ZERO {
             return Ok(());
         }
+        self.paint_image_fitted(
+            visible_bounds,
+            image_bounds,
+            corner_radii.clamp_radii_for_quad_size(visible_bounds.size),
+            data,
+            frame_index,
+            grayscale,
+        )
+    }
 
+    /// [`Self::paint_image`] for object-fit layouts: paint the `visible`
+    /// rect of an image whose fitted content box is `fitted` (equal or
+    /// larger, e.g. `ObjectFit::Cover`). The atlas tile is CROPPED to the
+    /// visible sub-rect so the sprite's bounds are exactly `visible` —
+    /// corner radii round the element's actual corners. (Cover used to
+    /// overpaint the fitted box and rely on the rectangular content mask,
+    /// which sliced off the rounding on every cropped side.)
+    pub fn paint_image_fitted(
+        &mut self,
+        visible: Bounds<Pixels>,
+        fitted: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        let crop = (visible != fitted).then_some((visible, fitted));
+        let bounds = self.snap_bounds(visible);
         let params = RenderImageParams {
             image_id: data.id,
             frame_index,
@@ -4526,63 +4765,44 @@ impl Window {
                 )))
             })?
             .expect("Callback above only returns Some");
-
-        let visible_bounds_snapped = self.snap_bounds(visible_bounds);
-
-        let sub_tile = if visible_bounds == image_bounds {
-            tile
-        } else {
-            let x_offset_ratio =
-                (visible_bounds.origin.x - image_bounds.origin.x) / image_bounds.size.width;
-            let y_offset_ratio =
-                (visible_bounds.origin.y - image_bounds.origin.y) / image_bounds.size.height;
-            let width_ratio = visible_bounds.size.width / image_bounds.size.width;
-            let height_ratio = visible_bounds.size.height / image_bounds.size.height;
-
-            let tile_origin_x = tile.bounds.origin.x.0;
-            let tile_origin_y = tile.bounds.origin.y.0;
-            let tile_width = tile.bounds.size.width.0;
-            let tile_height = tile.bounds.size.height.0;
-
-            let sub_origin_x = tile_origin_x + (x_offset_ratio * tile_width as f32).round() as i32;
-            let sub_origin_y = tile_origin_y + (y_offset_ratio * tile_height as f32).round() as i32;
-            let sub_width = (width_ratio * tile_width as f32).round() as i32;
-            let sub_height = (height_ratio * tile_height as f32).round() as i32;
-
-            let max_x = tile_origin_x + tile_width;
-            let max_y = tile_origin_y + tile_height;
-
-            let clamped_origin_x = sub_origin_x.clamp(tile_origin_x, max_x);
-            let clamped_origin_y = sub_origin_y.clamp(tile_origin_y, max_y);
-            let clamped_width = sub_width.min(max_x - clamped_origin_x).max(0);
-            let clamped_height = sub_height.min(max_y - clamped_origin_y).max(0);
-
-            AtlasTile {
-                bounds: Bounds {
-                    origin: point(
-                        DevicePixels(clamped_origin_x),
-                        DevicePixels(clamped_origin_y),
-                    ),
-                    size: size(DevicePixels(clamped_width), DevicePixels(clamped_height)),
-                },
-                ..tile
+        // Crop the atlas tile to the visible fraction of the fitted box
+        // (proportional UV mapping; ≤1px rounding on arbitrary crops).
+        let tile = match crop {
+            Some((visible, fitted)) => {
+                let fw = f32::from(fitted.size.width).max(1.0);
+                let fh = f32::from(fitted.size.height).max(1.0);
+                let fx = (f32::from(visible.origin.x) - f32::from(fitted.origin.x)) / fw;
+                let fy = (f32::from(visible.origin.y) - f32::from(fitted.origin.y)) / fh;
+                let fsw = f32::from(visible.size.width) / fw;
+                let fsh = f32::from(visible.size.height) / fh;
+                let mut tile = tile;
+                let tw = tile.bounds.size.width.0 as f32;
+                let th = tile.bounds.size.height.0 as f32;
+                tile.bounds.origin.x =
+                    DevicePixels(tile.bounds.origin.x.0 + (fx * tw).round() as i32);
+                tile.bounds.origin.y =
+                    DevicePixels(tile.bounds.origin.y.0 + (fy * th).round() as i32);
+                tile.bounds.size.width = DevicePixels((fsw * tw).round().max(1.0) as i32);
+                tile.bounds.size.height = DevicePixels((fsh * th).round().max(1.0) as i32);
+                tile
             }
+            None => tile,
         };
-
         let content_mask = self.snapped_content_mask();
-        let corner_radii = corner_radii
-            .clamp_radii_for_quad_size(visible_bounds.size)
-            .scale(self.scale_factor());
+        let corner_radii = corner_radii.scale(self.scale_factor());
+        // Per-pixel fade in the shader — bounds-conservative alpha blanked a
+        // whole image the moment its edge touched the band (user report).
         let opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
             pad: 0,
             grayscale: grayscale.into(),
-            bounds: visible_bounds_snapped,
+            bounds,
             content_mask,
             corner_radii,
-            tile: sub_tile,
+            fade: self.scaled_edge_fade(),
+            tile,
             opacity,
         });
         Ok(())
